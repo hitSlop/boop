@@ -47,43 +47,38 @@ pub fn build(
         ""
     };
 
-    // Non-destructive remote-only pbxproj patch: disables remote codesigning so xtool 2.0 beta's
-    // in-process CodesignTool doesn't choke on codeless xcframeworks (signing happens locally on Mac).
-    let pbxproj_patch = if project.signing.disable_remote_codesign {
-        r#"python3 - <<'PY'
-import glob
-for p in glob.glob("*.xcodeproj/project.pbxproj"):
-    s = open(p).read()
-    if "CODE_SIGNING_ALLOWED = NO;" not in s and "CODE_SIGN_STYLE = Automatic;" in s:
-        s = s.replace(
-            "CODE_SIGN_STYLE = Automatic;",
-            "CODE_SIGN_STYLE = Manual;\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;\n\t\t\t\tCODE_SIGNING_REQUIRED = NO;\n\t\t\t\tAD_HOC_CODE_SIGNING_ALLOWED = NO;\n\t\t\t\tCODE_SIGN_IDENTITY = \"\";"
-        )
-        open(p, "w").write(s)
-PY
-"#
+    // Non-destructive remote-only project patcher: disables remote codesigning across all
+    // buildSettings blocks (Automatic, Manual, omitted, or Xcode 27.2 JSON) so xtool 2.0 beta's
+    // in-process CodesignTool doesn't choke on codeless xcframeworks (signing happens locally on Mac),
+    // optionally enables Swift CAS, and preserves final mtimes across unchanged SHA-256 outputs.
+    let cas_setup = if project.project.compilation_cache {
+        "mkdir -p \"$HOME/boop-cache/swift-cas\"\n"
     } else {
         ""
     };
-
-    let cas_patch = if project.project.compilation_cache {
-        r#"mkdir -p "$HOME/boop-cache/swift-cas"
-python3 - <<'PY'
-import glob, os
-cas_dir = os.path.expanduser("~/boop-cache/swift-cas")
-for p in glob.glob("*.xcodeproj/project.pbxproj"):
-    s = open(p).read()
-    if "COMPILATION_CACHE_ENABLE_CACHING" not in s:
-        s = s.replace(
-            "buildSettings = {",
-            f'buildSettings = {{\n\t\t\t\tCOMPILATION_CACHE_ENABLE_CACHING = YES;\n\t\t\t\tCOMPILATION_CACHE_CAS_PATH = "{cas_dir}";\n\t\t\t\tSWIFT_ENABLE_EXPLICIT_MODULES = YES;'
-        )
-        open(p, "w").write(s)
-PY
-"#
-    } else {
-        ""
-    };
+    let mut patch_flags = vec![
+        "--stamp-file".to_string(),
+        "xtool/.boop-project-inputs.json".to_string(),
+    ];
+    if project.signing.disable_remote_codesign {
+        patch_flags.push("--disable-codesign".to_string());
+    }
+    if project.project.compilation_cache {
+        patch_flags.push("--cas-dir".to_string());
+        patch_flags.push("$HOME/boop-cache/swift-cas".to_string());
+    }
+    let patch_flag_str = patch_flags
+        .iter()
+        .map(|flag| {
+            if flag.starts_with("$HOME/") {
+                format!("\"{flag}\"")
+            } else {
+                crate::shell_escape(flag)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let patch_script = include_str!("../../scripts/patch-xcodeproj.py");
 
     if !std::path::Path::new(app_name)
         .file_name()
@@ -112,26 +107,9 @@ mkdir -p "$HOME/.boop-locks"
 exec 9>"$HOME/.boop-locks/$(basename '{remote_workspace}').lock"
 flock 9
 {cache}
-{clean_step}{pbxproj_patch}{cas_patch}
-# Preserve the timestamp of the final patched project across checksum syncs.
-# Swift Build keys parts of its dependency graph on the pbxproj timestamp.
-python3 - <<'PY'
-import glob, hashlib, json, os
-from pathlib import Path
-cache = Path("xtool/.boop-project-inputs.json")
-old = json.loads(cache.read_text()) if cache.is_file() else dict()
-current = dict()
-for name in glob.glob("*.xcodeproj/project.pbxproj"):
-    p = Path(name)
-    digest = hashlib.sha256(p.read_bytes()).hexdigest()
-    stamp = p.stat().st_mtime_ns
-    if name in old and old[name][0] == digest:
-        stamp = old[name][1]
-        os.utime(p, ns=(p.stat().st_atime_ns, stamp))
-    current[name] = [digest, stamp]
-cache.parent.mkdir(exist_ok=True)
-cache.write_text(json.dumps(current))
-PY
+{clean_step}{cas_setup}python3 - {patch_flag_str} <<'BOOP_PATCH_PY'
+{patch_script}
+BOOP_PATCH_PY
 {xtool_cmd}
 "#
     );
@@ -159,4 +137,151 @@ PY
         diagnostics,
         output: res.output,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn run_patcher(dir: &Path, extra_args: &[&str]) {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/patch-xcodeproj.py");
+        let out = Command::new("python3")
+            .arg(&script)
+            .args(extra_args)
+            .current_dir(dir)
+            .output()
+            .expect("python3 should execute patch-xcodeproj.py");
+        assert!(
+            out.status.success(),
+            "patch-xcodeproj.py failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn patches_openstep_automatic_manual_and_omitted_signing() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("Sample.xcodeproj");
+        fs::create_dir_all(&proj).unwrap();
+        let pbx = proj.join("project.pbxproj");
+        let original = r#"// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	objects = {
+		AUTO01 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = TEAM123456;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.auto;
+			};
+			name = Debug;
+		};
+		MANUAL01 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Manual;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";
+				PROVISIONING_PROFILE_SPECIFIER = "My AdHoc Profile";
+				DEVELOPMENT_TEAM = TEAM123456;
+				OTHER_LDFLAGS = (
+					"-ObjC",
+					"/* not a brace { */",
+				);
+			};
+			name = Release;
+		};
+		OMITTED01 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.omitted;
+			};
+			name = Debug;
+		};
+	};
+}
+"#;
+        fs::write(&pbx, original).unwrap();
+
+        run_patcher(dir.path(), &["--disable-codesign"]);
+        let patched = fs::read_to_string(&pbx).unwrap();
+
+        let count_line = |needle: &str| patched.lines().filter(|l| l.trim() == needle).count();
+        assert_eq!(count_line("CODE_SIGNING_ALLOWED = NO;"), 3);
+        assert_eq!(count_line("CODE_SIGNING_REQUIRED = NO;"), 3);
+        assert_eq!(count_line("AD_HOC_CODE_SIGNING_ALLOWED = NO;"), 3);
+        assert_eq!(count_line("CODE_SIGN_STYLE = Manual;"), 3);
+        assert_eq!(count_line("CODE_SIGN_IDENTITY = \"\";"), 3);
+        assert!(!patched.contains("CODE_SIGN_STYLE = Automatic;"));
+        assert!(!patched.contains("Apple Distribution"));
+        assert!(!patched.contains("PROVISIONING_PROFILE_SPECIFIER"));
+        assert!(!patched.contains("iPhone Developer"));
+        // Preserve DEVELOPMENT_TEAM and unrelated settings
+        assert_eq!(patched.matches("DEVELOPMENT_TEAM = TEAM123456;").count(), 2);
+        assert!(patched.contains("\"/* not a brace { */\""));
+
+        // Idempotency + mtime preservation check
+        let first_mtime = fs::metadata(&pbx).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        // Rewrite original (simulating a fresh rsync with a newer mtime) and re-patch
+        fs::write(&pbx, original).unwrap();
+        run_patcher(dir.path(), &["--disable-codesign"]);
+        let second = fs::read_to_string(&pbx).unwrap();
+        let second_mtime = fs::metadata(&pbx).unwrap().modified().unwrap();
+        assert_eq!(patched, second);
+        assert_eq!(first_mtime, second_mtime);
+    }
+
+    #[test]
+    fn patches_json_xcproj_and_cas_settings() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("Modern.xcodeproj");
+        fs::create_dir_all(&proj).unwrap();
+        let xcproj = proj.join("project.xcproj");
+        let original = r#"{
+  "rootObject": "R1",
+  "objects": {
+    "CFG1": {
+      "isa": "XCBuildConfiguration",
+      "name": "Debug",
+      "buildSettings": {
+        "CODE_SIGN_STYLE": "Manual",
+        "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Development",
+        "PROVISIONING_PROFILE": "uuid-123",
+        "DEVELOPMENT_TEAM": "TEAM777",
+        "PRODUCT_BUNDLE_IDENTIFIER": "com.example.modern"
+      }
+    }
+  }
+}
+"#;
+        fs::write(&xcproj, original).unwrap();
+
+        run_patcher(
+            dir.path(),
+            &["--disable-codesign", "--cas-dir", "/tmp/test-cas"],
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xcproj).unwrap()).unwrap();
+        let bs = &parsed["objects"]["CFG1"]["buildSettings"];
+
+        assert_eq!(bs["CODE_SIGN_STYLE"], "Manual");
+        assert_eq!(bs["CODE_SIGNING_ALLOWED"], "NO");
+        assert_eq!(bs["CODE_SIGNING_REQUIRED"], "NO");
+        assert_eq!(bs["AD_HOC_CODE_SIGNING_ALLOWED"], "NO");
+        assert_eq!(bs["CODE_SIGN_IDENTITY"], "");
+        assert!(bs.get("CODE_SIGN_IDENTITY[sdk=iphoneos*]").is_none());
+        assert!(bs.get("PROVISIONING_PROFILE").is_none());
+        assert_eq!(bs["DEVELOPMENT_TEAM"], "TEAM777");
+        assert_eq!(bs["COMPILATION_CACHE_ENABLE_CACHING"], "YES");
+        assert_eq!(bs["COMPILATION_CACHE_CAS_PATH"], "/tmp/test-cas");
+        assert_eq!(bs["SWIFT_ENABLE_EXPLICIT_MODULES"], "YES");
+    }
 }

@@ -4,3 +4,4 @@ pub mod device;
 pub mod ipa;
 pub mod sdk;
 pub mod sign;
+pub mod xcodeproj;

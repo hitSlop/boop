@@ -341,8 +341,30 @@ pub fn detect_project(dir: &Path) -> Result<ProjectConfig> {
     if project_yml.exists() {
         let raw = fs::read_to_string(&project_yml).unwrap_or_default();
         let name = extract_yaml_scalar(&raw, "name:").unwrap_or_else(|| dir_name.clone());
-        let bundle_id = extract_yaml_scalar(&raw, "PRODUCT_BUNDLE_IDENTIFIER:");
-        let team_id = extract_yaml_scalar(&raw, "DEVELOPMENT_TEAM:");
+        let mut bundle_id = extract_yaml_scalar(&raw, "PRODUCT_BUNDLE_IDENTIFIER:");
+        let mut team_id = extract_yaml_scalar(&raw, "DEVELOPMENT_TEAM:");
+        let mut assets = detect_asset_catalogs(dir, &name);
+        if bundle_id.is_none() || team_id.is_none() || assets.min_deployment_target.is_none() {
+            let sibling_proj = dir.join(format!("{name}.xcodeproj"));
+            if sibling_proj.is_dir()
+                && let Some(meta) = crate::apple::xcodeproj::inspect_xcodeproj(&sibling_proj)
+            {
+                if bundle_id.is_none() {
+                    bundle_id = meta.bundle_id;
+                }
+                if team_id.is_none() {
+                    team_id = meta.team_id;
+                }
+                if !assets.sources.is_empty() {
+                    if assets.app_icon.is_none() {
+                        assets.app_icon = meta.app_icon;
+                    }
+                    if assets.min_deployment_target.is_none() {
+                        assets.min_deployment_target = meta.deployment_target;
+                    }
+                }
+            }
+        }
         let metal_bundles = detect_metal_overlays(dir);
         let mut excludes = Vec::new();
         for noisy in [
@@ -359,7 +381,6 @@ pub fn detect_project(dir: &Path) -> Result<ProjectConfig> {
                 excludes.push(noisy.to_string());
             }
         }
-        let assets = detect_asset_catalogs(dir, &name);
         return Ok(ProjectConfig {
             project: ProjectSection {
                 name: name.clone(),
@@ -384,36 +405,62 @@ pub fn detect_project(dir: &Path) -> Result<ProjectConfig> {
 
     // 2. Any *.xcodeproj
     if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("xcodeproj") {
-                let stem = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&dir_name)
-                    .to_string();
-                let assets = detect_asset_catalogs(dir, &stem);
-                return Ok(ProjectConfig {
-                    project: ProjectSection {
-                        name: stem.clone(),
-                        engine: "xtool".to_string(),
-                        scheme: Some(stem.clone()),
-                        app_name: Some(stem),
-                        bundle_id: None,
-                        team_id: None,
-                        worker: None,
-                        default_device: None,
-                        compilation_cache: false,
-                    },
-                    sync: SyncSection::default(),
-                    signing: SigningSection::default(),
-                    metal: MetalSection {
-                        bundles: detect_metal_overlays(dir),
-                    },
-                    assets,
-                    distribution: detect_distribution(dir),
-                });
+        let mut xcodeprojs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("xcodeproj"))
+            .collect();
+        xcodeprojs.sort();
+        if let Some(p) = xcodeprojs.into_iter().next() {
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&dir_name)
+                .to_string();
+            let meta = crate::apple::xcodeproj::inspect_xcodeproj(&p);
+            let scheme = meta
+                .as_ref()
+                .and_then(|m| m.scheme.clone())
+                .unwrap_or_else(|| stem.clone());
+            let app_name = meta
+                .as_ref()
+                .and_then(|m| m.app_name.clone())
+                .unwrap_or_else(|| stem.clone());
+            let bundle_id = meta.as_ref().and_then(|m| m.bundle_id.clone());
+            let team_id = meta.as_ref().and_then(|m| m.team_id.clone());
+
+            let mut assets = detect_asset_catalogs(dir, &app_name);
+            if !assets.sources.is_empty()
+                && let Some(ref m) = meta
+            {
+                if assets.app_icon.is_none() {
+                    assets.app_icon = m.app_icon.clone();
+                }
+                if assets.min_deployment_target.is_none() {
+                    assets.min_deployment_target = m.deployment_target.clone();
+                }
             }
+
+            return Ok(ProjectConfig {
+                project: ProjectSection {
+                    name: stem,
+                    engine: "xtool".to_string(),
+                    scheme: Some(scheme),
+                    app_name: Some(app_name),
+                    bundle_id,
+                    team_id,
+                    worker: None,
+                    default_device: None,
+                    compilation_cache: false,
+                },
+                sync: SyncSection::default(),
+                signing: SigningSection::default(),
+                metal: MetalSection {
+                    bundles: detect_metal_overlays(dir),
+                },
+                assets,
+                distribution: detect_distribution(dir),
+            });
         }
     }
 
@@ -653,6 +700,67 @@ mod tests {
         assert_eq!(cfg.project.team_id.as_deref(), Some("TEAM123456"));
         assert_eq!(cfg.metal.bundles.len(), 1);
         assert_eq!(cfg.metal.bundles[0].target_bundle, "AppUI_Design.bundle");
+    }
+
+    #[test]
+    fn detects_plain_xcodeproj_metadata_and_assets() {
+        let dir = tempdir().unwrap();
+        let proj = dir.path().join("PlainApp.xcodeproj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(dir.path().join("Resources/Assets.xcassets")).unwrap();
+        let doc = serde_json::json!({
+            "rootObject": "R1",
+            "objects": {
+                "R1": {
+                    "isa": "PBXProject",
+                    "buildConfigurationList": "PC",
+                    "targets": ["T1"]
+                },
+                "PC": {
+                    "isa": "XCConfigurationList",
+                    "buildConfigurations": ["PD"]
+                },
+                "PD": {
+                    "isa": "XCBuildConfiguration",
+                    "name": "Debug",
+                    "buildSettings": {
+                        "DEVELOPMENT_TEAM": "TEAM424242",
+                        "IPHONEOS_DEPLOYMENT_TARGET": "18.1"
+                    }
+                },
+                "T1": {
+                    "isa": "PBXNativeTarget",
+                    "name": "PlainApp",
+                    "productType": "com.apple.product-type.application",
+                    "buildConfigurationList": "TC"
+                },
+                "TC": {
+                    "isa": "XCConfigurationList",
+                    "buildConfigurations": ["TD"]
+                },
+                "TD": {
+                    "isa": "XCBuildConfiguration",
+                    "name": "Debug",
+                    "buildSettings": {
+                        "PRODUCT_BUNDLE_IDENTIFIER": "com.example.plainapp",
+                        "ASSETCATALOG_COMPILER_APPICON_NAME": "CustomIcon"
+                    }
+                }
+            }
+        });
+        fs::write(proj.join("project.xcproj"), doc.to_string()).unwrap();
+
+        let cfg = detect_project(dir.path()).unwrap();
+        assert_eq!(cfg.project.name, "PlainApp");
+        assert_eq!(cfg.project.scheme.as_deref(), Some("PlainApp"));
+        assert_eq!(cfg.project.app_name.as_deref(), Some("PlainApp"));
+        assert_eq!(
+            cfg.project.bundle_id.as_deref(),
+            Some("com.example.plainapp")
+        );
+        assert_eq!(cfg.project.team_id.as_deref(), Some("TEAM424242"));
+        assert_eq!(cfg.assets.app_icon.as_deref(), Some("CustomIcon"));
+        assert_eq!(cfg.assets.min_deployment_target.as_deref(), Some("18.1"));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+/target
+/.boop
+.DS_Store
+*.log
+.env
+.env.*
+_docs/
